@@ -203,6 +203,8 @@ do
     "show_outer","show_cross","show_cuts","show_face","show_jaws","show_chin","show_nose","show_ears",
     "ear_back","ear_rot","ear_x","ear_scale","ear_y","ear_z",
     "alpha_front","alpha_back",
+    -- GROUP ENABLES must persist as SHAPE:
+    "jawchin_en","nose_en","ears_en",
   }
 
   local POSE_KEYS = {"p1x","p1y","roll","radius_t","radius_px","roll_side","full_180"}
@@ -236,16 +238,21 @@ do
     return out, nil
   end
 
-  local dlg -- forward declare for selectedFileSafe
-  local function selectedFileSafe()
-    local s = (dlg and dlg.data and dlg.data.base_file) or "default.txt"
-    s = tostring(s)
+  local dlg -- forward declare
+  local CURRENT_PRESET_FILE = "default.txt" -- authoritative selection (do NOT trust dlg.data timing)
+
+  local function fileSafe(s)
+    s = tostring(s or "")
     s = s:gsub("[\\/]+", "")
     s = s:gsub("[^%w%._%-%s]", "")
     s = s:gsub("^%s+", ""):gsub("%s+$", "")
     if s == "" then s = "default.txt" end
     if not string.lower(s):match("%.txt$") then s = s .. ".txt" end
     return s
+  end
+
+  local function selectedFileSafe()
+    return fileSafe(CURRENT_PRESET_FILE)
   end
 
   local function ensureDefaultFiles()
@@ -289,6 +296,11 @@ do
 
         alpha_front=255,
         alpha_back=26,
+
+        -- group enables (shape)
+        jawchin_en=true,
+        nose_en=true,
+        ears_en=true,
 
         p1x=0.5, p1y=0.5,
         roll=0,
@@ -380,7 +392,6 @@ do
       elseif side == "bottom" then
         return 0, r, 0
       end
-      -- none selected => center
       return 0, 0, 0
     end
 
@@ -498,10 +509,7 @@ do
       end
     end
 
-    -- ==========================
-    -- Jaw + chin lines
-    -- Chin height is ADDITIVE to jaw height (chin height is relative to jaw height)
-    -- ==========================
+    -- Jaw/chin
     do
       local cw = clamp((chinW_pct or 13), 0, 100) / 100.0 * r
       local cd = clamp((chinD_pct or 92), 0, 100) / 100.0 * r
@@ -558,9 +566,7 @@ do
       end
     end
 
-    -- ==========================
-    -- NOSE (top is base; bottom/tip additive down from top)
-    -- ==========================
+    -- Nose (top base; bottom/tip additive)
     if show_nose then
       local topPct = clamp((noseBR_pct or 50), 0, 100) / 100.0
       local topY = topPct * r
@@ -608,11 +614,7 @@ do
       p = pixForZ((tz+bz)*0.5); if p then drawLineSet(img, tx, ty, bx, by, p) end
     end
 
-    -- ==========================
-    -- EARS
-    -- - Ear base Z is centered on sphere (0), not on the front cut.
-    -- - Ear rotation slider is offset by -180 so "0" matches corrected orientation.
-    -- ==========================
+    -- Ears
     if show_ears then
       local CUT_FRAC = cutFracFromDepth(cutDepthPct)
       local cutx = r * CUT_FRAC
@@ -702,8 +704,7 @@ do
       drawEar( 1)
     end
 
-    -- OUTER OUTLINE: must follow the pivot-selected rotation translation.
-    -- Draw it as a 2D circle centered at the transformed sphere center (0,0,0).
+    -- Outer outline follows pivot-selected transform
     if show_outer then
       local ocx, ocy = xform3D_pivot(0, 0, 0)
       local prevx, prevy
@@ -878,6 +879,7 @@ do
 
   local function applyShapeToUI(t)
     loading = true
+
     local function setSlider(id, v)
       if v == nil then return end
       pcall(function() dlg:modify{ id=id, value=tonumber(v) or dlg.data[id] } end)
@@ -922,6 +924,11 @@ do
 
     setSlider("alpha_front", t.alpha_front)
     setSlider("alpha_back",  t.alpha_back)
+
+    -- GROUP ENABLES (shape)
+    setCheck("jawchin_en", t.jawchin_en)
+    setCheck("nose_en",    t.nose_en)
+    setCheck("ears_en",    t.ears_en)
 
     loading = false
   end
@@ -1012,6 +1019,11 @@ do
 
       alpha_front = dlg.data.alpha_front or 255,
       alpha_back  = dlg.data.alpha_back  or 26,
+
+      -- GROUP ENABLES (shape)
+      jawchin_en = (dlg.data.jawchin_en == true),
+      nose_en    = (dlg.data.nose_en == true),
+      ears_en    = (dlg.data.ears_en == true),
     }
 
     local ok, err = mergeIntoPreset(path, patch)
@@ -1073,7 +1085,7 @@ do
     if dlg.data.roll_side_top then return "top" end
     if dlg.data.roll_side_left then return "left" end
     if dlg.data.roll_side_right then return "right" end
-    return "" -- none selected => center
+    return ""
   end
 
   function updatePreview()
@@ -1122,7 +1134,6 @@ do
     local show_cross = (dlg.data.show_cross == true)
     local show_cuts  = (dlg.data.show_cuts  == true)
 
-    -- group enables must control drawing visibility
     local en_jawchin = (dlg.data.jawchin_en == true)
     local en_nose    = (dlg.data.nose_en == true)
     local en_ears    = (dlg.data.ears_en == true)
@@ -1210,14 +1221,25 @@ do
   -- =========================
   -- DIALOG (grouped layout)
   -- =========================
-  dlg = Dialog("3D Head")
+  dlg = Dialog("Sphere – All Rot from Bottom")
 
   dlg:combobox{
     id="base_file",
     label="File",
     options=BASE_OPTIONS,
     option="default.txt",
-    onchange=function() loadShape() end
+    onchange=function(ev)
+      -- IMPORTANT: use the event option as the authoritative selection
+      if ev and ev.option then
+        CURRENT_PRESET_FILE = ev.option
+      elseif dlg and dlg.data and dlg.data.base_file then
+        CURRENT_PRESET_FILE = dlg.data.base_file
+      else
+        CURRENT_PRESET_FILE = "default.txt"
+      end
+      CURRENT_PRESET_FILE = fileSafe(CURRENT_PRESET_FILE)
+      loadShape()
+    end
   }
 
   dlg:newrow()
@@ -1332,7 +1354,7 @@ do
   dlg:newrow()
 
   dlg:slider{ id="alpha_front", label="Alpha:", min=0, max=255, value=255, onchange=updatePreview }
-  dlg:slider{ id="alpha_back",  min=0, max=255, value=26,  onchange=updatePreview }
+  dlg:slider{ id="alpha_back",  label="Alpha:", min=0, max=255, value=26,  onchange=updatePreview }
   dlg:newrow()
 
   dlg:button{ text="Apply", onclick=function() applyPreview(); dlg:close() end }
@@ -1343,6 +1365,12 @@ do
   end}
 
   dlg:show{ wait=false }
+
+  -- Initialize authoritative selection from the dialog AFTER show.
+  do
+    local v = (dlg.data and dlg.data.base_file) or "default.txt"
+    CURRENT_PRESET_FILE = fileSafe(v)
+  end
 
   for g,_ in pairs(GROUP_WIDGETS) do
     setGroupState(g)
