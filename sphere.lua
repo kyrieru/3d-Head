@@ -10,7 +10,7 @@
 -- UI:
 --   Save shape / Load shape  (reads/writes SHAPE keys only, inside the same file)
 --   Save pose  / Load pose   (reads/writes POSE keys only, inside the same file)
---   NOTE: Load pose is still the only time radius is loaded.
+--   NOTE (UPDATED): pose save/load stores absolute radius (px), ignores selection bbox, AND stores XY position.
 --
 -- Opacity rules (UPDATED):
 --   - Front lines alpha = fg alpha * (front_alpha/255)
@@ -19,7 +19,6 @@
 --
 -- Back-face compositing rule:
 --   - A lower-alpha pixel will NOT overwrite an existing higher-alpha pixel.
---     Prevents back-face lines from drawing over front opaque lines.
 --
 -- Back-face skip:
 --   - If back alpha is 0, all back-face processing is skipped.
@@ -71,7 +70,6 @@ do
 
   local function deg2rad(d) return d * math.pi / 180 end
 
-  -- Lua atan2 compatibility
   local function atan2(y, x)
     local ok, v = pcall(function() return math.atan(y, x) end)
     if ok and v ~= nil then return v end
@@ -89,7 +87,6 @@ do
     return 0
   end
 
-  -- Back-face compositing guard: only draw if new alpha is stronger than existing alpha.
   local function drawPixelStrong(img, x, y, pix)
     if not pix then return end
     if x < 0 or y < 0 or x >= img.width or y >= img.height then return end
@@ -102,7 +99,7 @@ do
   end
 
   local function drawLineSet(img, x0, y0, x1, y1, pix)
-    if not pix then return end -- IMPORTANT: allows skipping backface entirely
+    if not pix then return end
     x0 = math.floor(x0 + 0.5); y0 = math.floor(y0 + 0.5)
     x1 = math.floor(x1 + 0.5); y1 = math.floor(y1 + 0.5)
     local dx = math.abs(x1 - x0)
@@ -132,12 +129,6 @@ do
              b.y + math.floor(b.height / 2)
     end
     return math.floor(spr.width / 2), math.floor(spr.height / 2)
-  end
-
-  local function selectionMaxRadius(b)
-    if not b then return nil end
-    local d = math.min(b.width, b.height)
-    return math.max(2, math.floor((d - 1) / 2))
   end
 
   -- =========================
@@ -203,11 +194,19 @@ do
     "show_outer","show_cross","show_cuts","show_face","show_jaws","show_chin","show_nose","show_ears",
     "ear_back","ear_rot","ear_x","ear_scale","ear_y","ear_z",
     "alpha_front","alpha_back",
-    -- GROUP ENABLES must persist as SHAPE:
     "jawchin_en","nose_en","ears_en",
   }
 
-  local POSE_KEYS = {"p1x","p1y","roll","radius_t","radius_px","roll_side","full_180"}
+  local POSE_KEYS = {
+    "p1x","p1y",
+    "roll","spin",
+    "radius_t","radius_px",
+    "head_off_x","head_off_y",
+    "roll_side",
+    "full_180",
+    "combined",
+    "swap_x","swap_y",
+  }
 
   local PRESET_KEYS = {}
   do
@@ -219,7 +218,6 @@ do
   local function listPresetTxtFiles(dir)
     local files, err = app.fs.listFiles(dir)
     if not files then return {}, "Failed to list files: " .. (err or "unknown") end
-
     local out = {}
     local seen = {}
     for _, file in ipairs(files) do
@@ -233,13 +231,12 @@ do
         end
       end
     end
-
     table.sort(out, function(a,b) return string.lower(a) < string.lower(b) end)
     return out, nil
   end
 
-  local dlg -- forward declare
-  local CURRENT_PRESET_FILE = "default.txt" -- authoritative selection (do NOT trust dlg.data timing)
+  local dlg
+  local CURRENT_PRESET_FILE = "default.txt"
 
   local function fileSafe(s)
     s = tostring(s or "")
@@ -255,6 +252,9 @@ do
     return fileSafe(CURRENT_PRESET_FILE)
   end
 
+  local spriteMaxR = math.max(2, math.floor(math.min(spr.width, spr.height)/2) - 1)
+  local r0_sprite = clamp(math.max(6, math.floor(math.min(spr.width, spr.height)/4)), 2, spriteMaxR)
+
   local function ensureDefaultFiles()
     local path = presetPathForSelected("default.txt")
     if not app.fs.isFile(path) then
@@ -269,10 +269,6 @@ do
         chin_h=25,
         chin_d=92,
 
-        -- nose:
-        --   nose_br = TOP Y (0..r, % of r from top center down)
-        --   nose_bh = BOTTOM offset DOWN from TOP (additive, % of r)
-        --   nose_th = TIP offset DOWN from TOP (additive, % of r; clamped within top..bottom)
         nose_bh=20,
         nose_br=50,
         nose_th=60,
@@ -297,17 +293,22 @@ do
         alpha_front=255,
         alpha_back=26,
 
-        -- group enables (shape)
         jawchin_en=true,
         nose_en=true,
         ears_en=true,
 
         p1x=0.5, p1y=0.5,
         roll=0,
+        spin=0,
         radius_t=50,
         radius_px=0,
-        roll_side="", -- none selected => center
+        head_off_x=0,
+        head_off_y=0,
+        roll_side="",
         full_180=false,
+        combined=false,
+        swap_x=false,
+        swap_y=false,
       }, PRESET_KEYS)
     end
   end
@@ -345,7 +346,7 @@ do
     return clamp(frac, 0.05, 0.98)
   end
 
-  local function drawSphere(img, cx, cy, r, rotXdeg, rotYdeg, rotZdeg, fgColor,
+  local function drawSphere(img, cx, cy, r, rotXdeg, rotYdeg, rotZdeg, postVertDeg, fgColor,
                             roll_side,
                             cutDepthPct,
                             chinW_pct, chinH_pct, chinD_pct,
@@ -399,6 +400,37 @@ do
 
     local function proj(x, y) return cx + x, cy + y end
 
+    local function rotAroundAxis(x, y, z, ax, ay, az, c, s)
+      local dot = ax*x + ay*y + az*z
+      local cxv = ay*z - az*y
+      local cyv = az*x - ax*z
+      local czv = ax*y - ay*x
+      local k = (1 - c) * dot
+      return x*c + cxv*s + ax*k,
+             y*c + cyv*s + ay*k,
+             z*c + czv*s + az*k
+    end
+
+    local pv = deg2rad(postVertDeg or 0)
+    local pvC, pvS = math.cos(pv), math.sin(pv)
+
+    local axR, ayR, azR do
+      local x, y, z = 1, 0, 0
+      x, y, z = rotZ(x, y, z)
+      x, y, z = rotY(x, y, z)
+      x, y, z = rotX(x, y, z)
+      local m = math.sqrt(x*x + y*y + z*z)
+      if m < 0.000001 then axR, ayR, azR = 1, 0, 0 else axR, ayR, azR = x/m, y/m, z/m end
+    end
+
+    local axR_noYaw, ayR_noYaw, azR_noYaw do
+      local x, y, z = 1, 0, 0
+      x, y, z = rotZ(x, y, z)
+      x, y, z = rotX(x, y, z)
+      local m = math.sqrt(x*x + y*y + z*z)
+      if m < 0.000001 then axR_noYaw, ayR_noYaw, azR_noYaw = 1, 0, 0 else axR_noYaw, ayR_noYaw, azR_noYaw = x/m, y/m, z/m end
+    end
+
     local sr, sg, sb, sa = fgColor.red, fgColor.green, fgColor.blue, fgColor.alpha
 
     alpha_front = clamp(tonumber(alpha_front) or 255, 0, 255)
@@ -408,7 +440,6 @@ do
     local backA  = math.floor(sa * (alpha_back  / 255) + 0.5)
 
     local wirePix = app.pixelColor.rgba(sr, sg, sb, frontA)
-
     local backEnabled = (backA > 0)
     local backPix = backEnabled and app.pixelColor.rgba(sr, sg, sb, backA) or nil
 
@@ -417,6 +448,7 @@ do
       x, y, z = rotZ(x, y, z)
       x, y, z = rotY(x, y, z)
       x, y, z = rotX(x, y, z)
+      if pv ~= 0 then x, y, z = rotAroundAxis(x, y, z, axR, ayR, azR, pvC, pvS) end
       x = x + pivx; y = y + pivy; z = z + pivz
       local px, py = proj(x, y)
       return px, py, z
@@ -426,15 +458,14 @@ do
       x = x - pivx; y = y - pivy; z = z - pivz
       x, y, z = rotZ(x, y, z)
       x, y, z = rotX(x, y, z)
+      if pv ~= 0 then x, y, z = rotAroundAxis(x, y, z, axR_noYaw, ayR_noYaw, azR_noYaw, pvC, pvS) end
       x = x + pivx; y = y + pivy; z = z + pivz
       local px, py = proj(x, y)
       return px, py, z
     end
 
     local function pixForZ(zv)
-      if zv < 0 then
-        return backEnabled and backPix or nil
-      end
+      if zv < 0 then return backEnabled and backPix or nil end
       return wirePix
     end
 
@@ -449,29 +480,17 @@ do
       return pts
     end
 
-    local equatorPts = buildRingPoints(function(t)
-      return r * math.cos(t), 0, r * math.sin(t)
-    end)
-    local meridianPts = buildRingPoints(function(t)
-      return 0, r * math.sin(t), r * math.cos(t)
-    end)
+    local equatorPts = buildRingPoints(function(t) return r * math.cos(t), 0, r * math.sin(t) end)
+    local meridianPts = buildRingPoints(function(t) return 0, r * math.sin(t), r * math.cos(t) end)
 
     local CUT_FRAC = cutFracFromDepth(cutDepthPct)
     local cutx = r * CUT_FRAC
     local cutRem = r * math.sqrt(math.max(0, 1 - CUT_FRAC*CUT_FRAC))
 
-    local cutLeftPts = buildRingPoints(function(t)
-      return -cutx, cutRem * math.sin(t), cutRem * math.cos(t)
-    end)
-    local cutRightPts = buildRingPoints(function(t)
-      return  cutx, cutRem * math.sin(t), cutRem * math.cos(t)
-    end)
-    local cutTopPts = buildRingPoints(function(t)
-      return cutRem * math.sin(t), -cutx, cutRem * math.cos(t)
-    end)
-    local cutBottomPts = buildRingPoints(function(t)
-      return cutRem * math.sin(t),  cutx, cutRem * math.cos(t)
-    end)
+    local cutLeftPts = buildRingPoints(function(t) return -cutx, cutRem * math.sin(t), cutRem * math.cos(t) end)
+    local cutRightPts = buildRingPoints(function(t) return  cutx, cutRem * math.sin(t), cutRem * math.cos(t) end)
+    local cutTopPts = buildRingPoints(function(t) return cutRem * math.sin(t), -cutx, cutRem * math.cos(t) end)
+    local cutBottomPts = buildRingPoints(function(t) return cutRem * math.sin(t),  cutx, cutRem * math.cos(t) end)
 
     local segs = {}
     local function addSegmentsFrom(pts, kind)
@@ -566,7 +585,7 @@ do
       end
     end
 
-    -- Nose (top base; bottom/tip additive)
+    -- Nose
     if show_nose then
       local topPct = clamp((noseBR_pct or 50), 0, 100) / 100.0
       local topY = topPct * r
@@ -704,7 +723,6 @@ do
       drawEar( 1)
     end
 
-    -- Outer outline follows pivot-selected transform
     if show_outer then
       local ocx, ocy = xform3D_pivot(0, 0, 0)
       local prevx, prevy
@@ -723,37 +741,91 @@ do
   end
 
   -- =========================
-  -- Radius base (selection aware)
+  -- UI state
   -- =========================
-  local spriteMaxR = math.max(2, math.floor(math.min(spr.width, spr.height)/2) - 1)
-  local b0 = getSelectionBounds()
-  local selR0 = selectionMaxRadius(b0)
-  local r0 = clamp(selR0 or math.max(6, math.floor(math.min(spr.width, spr.height)/4)), 2, spriteMaxR)
-
   local PAD_W, PAD_H = 72, 72
   local margin = 6
 
-  local drag1 = false
   local p1x, p1y = 0.5, 0.5
+  local head_off_x, head_off_y = 0, 0
 
-  local function screenToN(x, y)
-    local nx = (x - margin) / (PAD_W - margin*2)
-    local ny = (y - margin) / (PAD_H - margin*2)
+  local dragRot = false
+  local dragRoll = false
+  local dragPosMid = false
+  local lastMidX, lastMidY = 0, 0
+
+  local dragPosLeft = false
+  local lastPosX, lastPosY = 0, 0
+
+  local ACCUM = {}
+
+  local function getFrameKey()
+    local fr = app.activeFrame
+    if fr and fr.frameNumber then return fr.frameNumber end
+    return 1
+  end
+
+  local function ensureAccumForFrame(frnum)
+    if not ACCUM[frnum] then
+      local img = Image(spr.width, spr.height, spr.colorMode)
+      img:clear()
+      ACCUM[frnum] = img
+    end
+    return ACCUM[frnum]
+  end
+
+  local function clearAccum()
+    ACCUM = {}
+  end
+
+  local function screenToN(x, y, W, H)
+    W = W or PAD_W
+    H = H or PAD_H
+    local nx = (x - margin) / (W - margin*2)
+    local ny = (y - margin) / (H - margin*2)
     return clamp(nx, 0, 1), clamp(ny, 0, 1)
   end
 
-  local function pad1ToYawPitch(nx, ny, full180)
+  local function yawFromNx(nx, full180)
     if full180 then
-      local yaw   = (nx - 0.5) * 360
-      local pitch = (0.5 - ny) * 360
-      return clamp(yaw,   -180, 180),
-             clamp(pitch, -180, 180)
+      return clamp((nx - 0.5) * 360, -180, 180)
     else
-      local yaw   = (nx - 0.5) * 180
-      local pitch = (0.5 - ny) * 180
-      return clamp(yaw,   -89, 89),
-             clamp(pitch, -89, 89)
+      return clamp((nx - 0.5) * 180, -90, 90)
     end
+  end
+
+  local function pvFromNy(ny, full180)
+    if full180 then
+      return clamp((0.5 - ny) * 360, -180, 180)
+    else
+      return clamp((0.5 - ny) * 180, -90, 90)
+    end
+  end
+
+  local function rollRange()
+    return (dlg and dlg.data and dlg.data.full_180 == true) and 180 or 90
+  end
+
+  local function roll1FromNx(nx)
+    local lim = rollRange()
+    return clamp((nx - 0.5) * (2*lim), -lim, lim)
+  end
+
+  local function roll2FromNy(ny)
+    local lim = rollRange()
+    return clamp((0.5 - ny) * (2*lim), -lim, lim)
+  end
+
+  local function nxFromRoll1(v)
+    local lim = rollRange()
+    if lim <= 0 then return 0.5 end
+    return clamp((v / (2*lim)) + 0.5, 0, 1)
+  end
+
+  local function nyFromRoll2(v)
+    local lim = rollRange()
+    if lim <= 0 then return 0.5 end
+    return clamp(0.5 - (v / (2*lim)), 0, 1)
   end
 
   local function radiusFromSliderT(t, baseR)
@@ -785,10 +857,114 @@ do
     end
   end
 
+  local function btnIs(ev, want)
+    local b = ev.button
+    if want == "LEFT" then
+      return (b == MouseButton.LEFT) or (b == 1) or (b == "left")
+    elseif want == "RIGHT" then
+      return (b == MouseButton.RIGHT) or (b == 2) or (b == "right")
+    elseif want == "MIDDLE" then
+      return (b == MouseButton.MIDDLE) or (b == 3) or (b == "middle")
+    end
+    return false
+  end
+
+  local function wheelDeltaY(ev)
+    local dy = 0
+    if ev.deltaY ~= nil then dy = ev.deltaY
+    elseif ev.dy ~= nil then dy = ev.dy
+    elseif ev.delta ~= nil then dy = ev.delta
+    elseif ev.wheelDelta ~= nil then dy = -ev.wheelDelta
+    end
+    return tonumber(dy) or 0
+  end
+
+  local function adjustRadiusByWheel(ev)
+    if not dlg then return end
+    local dy = wheelDeltaY(ev)
+    if dy == 0 then return end
+    local cur = tonumber(dlg.data.radius_t) or 50
+    local step = 2
+    if dy > 0 then
+      cur = cur - step -- wheel down => radius down
+    else
+      cur = cur + step -- wheel up => radius up
+    end
+    cur = clamp(cur, 0, 100)
+    pcall(function() dlg:modify{ id="radius_t", value=cur } end)
+  end
+
+  local function swapX() return (dlg and dlg.data and dlg.data.swap_x == true) end
+  local function swapY() return (dlg and dlg.data and dlg.data.swap_y == true) end
+
+  local function applyControlFromNxNy(controlKind, nx, ny)
+    if not dlg then return end
+    local full180 = (dlg.data.full_180 == true)
+
+    local sx = swapX()
+    local sy = swapY()
+
+    if controlKind == "rot" then
+      if not sx then
+        p1x = nx
+      else
+        pcall(function() dlg:modify{ id="roll", value=roll1FromNx(nx) } end)
+      end
+
+      if not sy then
+        p1y = ny
+      else
+        pcall(function() dlg:modify{ id="spin", value=roll2FromNy(ny) } end)
+      end
+    else
+      if not sx then
+        pcall(function() dlg:modify{ id="roll", value=roll1FromNx(nx) } end)
+      else
+        p1x = nx
+      end
+
+      if not sy then
+        pcall(function() dlg:modify{ id="spin", value=roll2FromNy(ny) } end)
+      else
+        p1y = ny
+      end
+    end
+
+    -- clamp actual p1 values (if they were affected indirectly)
+    p1x = clamp(p1x, 0, 1)
+    p1y = clamp(p1y, 0, 1)
+
+    -- clamp roll/spin to current limit
+    local lim = rollRange()
+    local r1 = clamp(tonumber(dlg.data.roll) or 0, -lim, lim)
+    local r2 = clamp(tonumber(dlg.data.spin) or 0, -lim, lim)
+    pcall(function() dlg:modify{ id="roll", value=r1 } end)
+    pcall(function() dlg:modify{ id="spin", value=r2 } end)
+  end
+
+  local function getControlDotNxNy(controlKind)
+    if not dlg then return 0.5, 0.5 end
+    local sx = swapX()
+    local sy = swapY()
+    local r1 = tonumber(dlg.data.roll) or 0
+    local r2 = tonumber(dlg.data.spin) or 0
+
+    local nx, ny
+
+    if controlKind == "rot" then
+      nx = (not sx) and p1x or nxFromRoll1(r1)
+      ny = (not sy) and p1y or nyFromRoll2(r2)
+    else
+      nx = (not sx) and nxFromRoll1(r1) or p1x
+      ny = (not sy) and nyFromRoll2(r2) or p1y
+    end
+
+    return clamp(nx,0,1), clamp(ny,0,1)
+  end
+
   -- =========================
   -- Grouped UI helpers
   -- =========================
-  local lastBaseR = -1
   local loading = false
   local wireAlphaForPad = 255
 
@@ -810,7 +986,7 @@ do
     end
   end
 
-  function updatePreview() end -- forward declare
+  function updatePreview() end
 
   local function groupHeader(g, labelText)
     dlg:check {
@@ -835,21 +1011,15 @@ do
     dlg:newrow()
   end
 
-  -- Roll-side: exclusive when selecting one, but allows "none selected" (center pivot).
   local function rollSideChecks(labelText, ids)
     local updating = false
-
     local function uncheckAll()
-      for _, id in ipairs(ids) do
-        dlg:modify { id = id, selected = false }
-      end
+      for _, id in ipairs(ids) do dlg:modify { id = id, selected = false } end
     end
-
     local function makeOnclick(id)
       return function()
         if updating then return end
         updating = true
-
         local now = (dlg.data[id] == true)
         if now then
           for _, other in ipairs(ids) do
@@ -859,12 +1029,10 @@ do
         else
           dlg:modify { id = id, selected = false }
         end
-
         updating = false
         updatePreview()
       end
     end
-
     for i, id in ipairs(ids) do
       local txt = id:match("roll_side_(.+)") or id
       if i == 1 then
@@ -879,7 +1047,6 @@ do
 
   local function applyShapeToUI(t)
     loading = true
-
     local function setSlider(id, v)
       if v == nil then return end
       pcall(function() dlg:modify{ id=id, value=tonumber(v) or dlg.data[id] } end)
@@ -925,7 +1092,6 @@ do
     setSlider("alpha_front", t.alpha_front)
     setSlider("alpha_back",  t.alpha_back)
 
-    -- GROUP ENABLES (shape)
     setCheck("jawchin_en", t.jawchin_en)
     setCheck("nose_en",    t.nose_en)
     setCheck("ears_en",    t.ears_en)
@@ -935,9 +1101,15 @@ do
 
   local function applyPoseToUI(t, includeRadius)
     loading = true
+
     if t.p1x ~= nil then p1x = clamp(tonumber(t.p1x) or p1x, 0, 1) end
     if t.p1y ~= nil then p1y = clamp(tonumber(t.p1y) or p1y, 0, 1) end
+
     if t.roll ~= nil then pcall(function() dlg:modify{ id="roll", value=tonumber(t.roll) or dlg.data.roll } end) end
+    if t.spin ~= nil then pcall(function() dlg:modify{ id="spin", value=tonumber(t.spin) or dlg.data.spin } end) end
+
+    if t.head_off_x ~= nil then head_off_x = tonumber(t.head_off_x) or head_off_x end
+    if t.head_off_y ~= nil then head_off_y = tonumber(t.head_off_y) or head_off_y end
 
     local function setCheck(id, v)
       if v == nil then return end
@@ -946,6 +1118,9 @@ do
     end
 
     setCheck("full_180", t.full_180)
+    setCheck("combined", t.combined)
+    setCheck("swap_x", t.swap_x)
+    setCheck("swap_y", t.swap_y)
 
     local rs = tostring(t.roll_side or ""):lower()
     pcall(function()
@@ -958,23 +1133,26 @@ do
     if rs ~= "" and rs ~= "center" then
       local map = { bottom="roll_side_bottom", top="roll_side_top", left="roll_side_left", right="roll_side_right" }
       local pick = map[rs]
-      if pick then
-        pcall(function() dlg:modify{ id=pick, selected = true } end)
-      end
+      if pick then pcall(function() dlg:modify{ id=pick, selected = true } end) end
     end
 
     if includeRadius then
-      local b = getSelectionBounds()
-      local baseR = selectionMaxRadius(b) or r0
-      baseR = clamp(math.floor(baseR + 0.5), 2, spriteMaxR)
-
       local rp = tonumber(t.radius_px)
       if rp and rp > 0 then
-        local newT = sliderTFromRadiusPx(rp, baseR)
+        local newT = sliderTFromRadiusPx(rp, r0_sprite)
         pcall(function() dlg:modify{ id="radius_t", value=newT } end)
       elseif t.radius_t ~= nil then
         pcall(function() dlg:modify{ id="radius_t", value=tonumber(t.radius_t) or dlg.data.radius_t } end)
       end
+    end
+
+    -- clamp roll/spin now that full_180 may have changed
+    do
+      local lim = rollRange()
+      local r1 = clamp(tonumber(dlg.data.roll) or 0, -lim, lim)
+      local r2 = clamp(tonumber(dlg.data.spin) or 0, -lim, lim)
+      pcall(function() dlg:modify{ id="roll", value=r1 } end)
+      pcall(function() dlg:modify{ id="spin", value=r2 } end)
     end
 
     loading = false
@@ -1020,7 +1198,6 @@ do
       alpha_front = dlg.data.alpha_front or 255,
       alpha_back  = dlg.data.alpha_back  or 26,
 
-      -- GROUP ENABLES (shape)
       jawchin_en = (dlg.data.jawchin_en == true),
       nose_en    = (dlg.data.nose_en == true),
       ears_en    = (dlg.data.ears_en == true),
@@ -1040,31 +1217,34 @@ do
     updatePreview()
   end
 
+  local function rollSideString()
+    if dlg.data.roll_side_bottom then return "bottom" end
+    if dlg.data.roll_side_top then return "top" end
+    if dlg.data.roll_side_left then return "left" end
+    if dlg.data.roll_side_right then return "right" end
+    return ""
+  end
+
   local function savePose()
     local filename = selectedFileSafe()
     local path = presetPathForSelected(filename)
 
-    local b = getSelectionBounds()
-    local baseR = selectionMaxRadius(b) or r0
-    baseR = clamp(math.floor(baseR + 0.5), 2, spriteMaxR)
-    local rPx = radiusFromSliderT(dlg.data.radius_t or 50, baseR)
-
-    local function rollSideString()
-      if dlg.data.roll_side_bottom then return "bottom" end
-      if dlg.data.roll_side_top then return "top" end
-      if dlg.data.roll_side_left then return "left" end
-      if dlg.data.roll_side_right then return "right" end
-      return "" -- none selected => center
-    end
+    local rPx = radiusFromSliderT(dlg.data.radius_t or 50, r0_sprite)
 
     local patch = {
       p1x = p1x,
       p1y = p1y,
       roll = dlg.data.roll or 0,
+      spin = dlg.data.spin or 0,
       radius_t = dlg.data.radius_t or 50,
       radius_px = rPx,
+      head_off_x = head_off_x,
+      head_off_y = head_off_y,
       roll_side = rollSideString(),
       full_180 = (dlg.data.full_180 == true),
+      combined = (dlg.data.combined == true),
+      swap_x = (dlg.data.swap_x == true),
+      swap_y = (dlg.data.swap_y == true),
     }
 
     local ok, err = mergeIntoPreset(path, patch)
@@ -1088,31 +1268,28 @@ do
     return ""
   end
 
-  function updatePreview()
-    if not dlg or loading then
-      if dlg then dlg:repaint() end
-      return
-    end
-
+  local function getCurrentParams()
     local b = getSelectionBounds()
     local cx, cy = getCenterFromBounds(b)
+
+    cx = cx + math.floor(head_off_x + 0.5)
+    cy = cy + math.floor(head_off_y + 0.5)
+
     cx = clamp(cx, 0, spr.width-1)
     cy = clamp(cy, 0, spr.height-1)
 
-    local baseR = selectionMaxRadius(b) or r0
-    baseR = clamp(math.floor(baseR + 0.5), 2, spriteMaxR)
-
-    if baseR ~= lastBaseR then
-      lastBaseR = baseR
-      if dlg.data.radius_t == nil then dlg:modify{ id="radius_t", value=50 } end
-    end
-
-    local r = radiusFromSliderT(dlg.data.radius_t or 50, baseR)
+    local r = radiusFromSliderT(dlg.data.radius_t or 50, r0_sprite)
 
     local full180 = (dlg.data.full_180 == true)
-    local yaw, pitch = pad1ToYawPitch(p1x, p1y, full180)
 
-    local roll = dlg.data.roll or 0
+    -- rotation values are stored as normalized p1x/p1y, but actual mapping for display/drag may be swapped.
+    -- drawing ALWAYS interprets yaw/postVert from p1x/p1y (not swapped); swap only changes UI control routing.
+    local yaw = yawFromNx(p1x, full180)
+    local postVert = pvFromNy(p1y, full180)
+
+    local roll = tonumber(dlg.data.roll) or 0
+    local spin = tonumber(dlg.data.spin) or 0
+
     local col = app.fgColor
 
     local cutDepth = dlg.data.cut_depth or 13
@@ -1156,22 +1333,103 @@ do
 
     local roll_side = currentRollSide()
 
+    return {
+      cx=cx, cy=cy, r=r,
+      pitch=spin,
+      yaw=yaw,
+      roll=roll,
+      postVert=postVert,
+      col=col,
+      roll_side=roll_side,
+      cutDepth=cutDepth,
+      chinW=chinW, chinH=chinH, chinD=chinD,
+      jawH=jawH, jawW=jawW, jawD=jawD,
+      noseBH=noseBH, noseBR=noseBR, noseTH=noseTH, noseTD=noseTD,
+      show_outer=show_outer, show_cross=show_cross, show_cuts=show_cuts,
+      show_face=show_face, show_jaws=show_jaws, show_chin=show_chin, show_nose=show_nose, show_ears=show_ears,
+      ear_back=ear_back, ear_rot=ear_rot, ear_x=ear_x, ear_scale=ear_scale, ear_y=ear_y, ear_z=ear_z,
+      a_front=a_front, a_back=a_back,
+    }
+  end
+
+  local function renderSphereOnlyToImage(p)
+    local img = Image(spr.width, spr.height, spr.colorMode)
+    img:clear()
+    drawSphere(img, p.cx, p.cy, p.r, p.pitch, p.yaw, p.roll, p.postVert, p.col,
+               p.roll_side,
+               p.cutDepth,
+               p.chinW, p.chinH, p.chinD,
+               p.jawH, p.jawW, p.jawD,
+               p.noseBH, p.noseBR, p.noseTH, p.noseTD,
+               p.show_outer, p.show_cross, p.show_cuts,
+               p.show_face, p.show_jaws, p.show_chin, p.show_nose, p.show_ears,
+               p.ear_back, p.ear_rot, p.ear_x, p.ear_scale, p.ear_y, p.ear_z,
+               p.a_front, p.a_back)
+    return img
+  end
+
+  function updatePreview()
+    if not dlg or loading then
+      if dlg then dlg:repaint() end
+      return
+    end
+
+    local p = getCurrentParams()
+    local frnum = getFrameKey()
+
     app.transaction(function()
       local previewLayer = ensureLayer(PREVIEW_NAME)
       local img = Image(spr.width, spr.height, spr.colorMode)
       img:clear()
 
+      local acc = ACCUM[frnum]
+      if acc then img:drawImage(acc, Point(0,0)) end
+
       wireAlphaForPad =
-        drawSphere(img, cx, cy, r, pitch, yaw, roll, col,
-                   roll_side,
-                   cutDepth,
-                   chinW, chinH, chinD,
-                   jawH, jawW, jawD,
-                   noseBH, noseBR, noseTH, noseTD,
-                   show_outer, show_cross, show_cuts,
-                   show_face, show_jaws, show_chin, show_nose, show_ears,
-                   ear_back, ear_rot, ear_x, ear_scale, ear_y, ear_z,
-                   a_front, a_back) or wireAlphaForPad
+        drawSphere(img, p.cx, p.cy, p.r, p.pitch, p.yaw, p.roll, p.postVert, p.col,
+                   p.roll_side,
+                   p.cutDepth,
+                   p.chinW, p.chinH, p.chinD,
+                   p.jawH, p.jawW, p.jawD,
+                   p.noseBH, p.noseBR, p.noseTH, p.noseTD,
+                   p.show_outer, p.show_cross, p.show_cuts,
+                   p.show_face, p.show_jaws, p.show_chin, p.show_nose, p.show_ears,
+                   p.ear_back, p.ear_rot, p.ear_x, p.ear_scale, p.ear_y, p.ear_z,
+                   p.a_front, p.a_back) or wireAlphaForPad
+
+      replaceCel(previewLayer, app.activeFrame, img, Point(0,0))
+    end)
+
+    dlg:repaint()
+    app.refresh()
+  end
+
+  local function addStamp()
+    if not dlg or loading then return end
+    local p = getCurrentParams()
+    local frnum = getFrameKey()
+
+    app.transaction(function()
+      local acc = ensureAccumForFrame(frnum)
+      local stamp = renderSphereOnlyToImage(p)
+      acc:drawImage(stamp, Point(0,0))
+
+      local previewLayer = ensureLayer(PREVIEW_NAME)
+      local img = Image(spr.width, spr.height, spr.colorMode)
+      img:clear()
+      img:drawImage(acc, Point(0,0))
+
+      wireAlphaForPad =
+        drawSphere(img, p.cx, p.cy, p.r, p.pitch, p.yaw, p.roll, p.postVert, p.col,
+                   p.roll_side,
+                   p.cutDepth,
+                   p.chinW, p.chinH, p.chinD,
+                   p.jawH, p.jawW, p.jawD,
+                   p.noseBH, p.noseBR, p.noseTH, p.noseTD,
+                   p.show_outer, p.show_cross, p.show_cuts,
+                   p.show_face, p.show_jaws, p.show_chin, p.show_nose, p.show_ears,
+                   p.ear_back, p.ear_rot, p.ear_x, p.ear_scale, p.ear_y, p.ear_z,
+                   p.a_front, p.a_back) or wireAlphaForPad
 
       replaceCel(previewLayer, app.activeFrame, img, Point(0,0))
     end)
@@ -1212,6 +1470,7 @@ do
       end
 
       deletePreviewLayer()
+      clearAccum()
       app.activeLayer = outLayer
     end)
 
@@ -1219,7 +1478,7 @@ do
   end
 
   -- =========================
-  -- DIALOG (grouped layout)
+  -- DIALOG
   -- =========================
   dlg = Dialog("Sphere – All Rot from Bottom")
 
@@ -1229,7 +1488,6 @@ do
     options=BASE_OPTIONS,
     option="default.txt",
     onchange=function(ev)
-      -- IMPORTANT: use the event option as the authoritative selection
       if ev and ev.option then
         CURRENT_PRESET_FILE = ev.option
       elseif dlg and dlg.data and dlg.data.base_file then
@@ -1255,50 +1513,270 @@ do
   dlg:slider{ id="cut_depth", min=0, max=95, value=13, onchange=updatePreview }
   dlg:newrow()
 
+  -- hidden internal sliders (kept for preset + numeric control)
+  dlg:slider{ id="roll", min=-180, max=180, value=0, visible=false, onchange=updatePreview }
+  dlg:slider{ id="spin", min=-180, max=180, value=0, visible=false, onchange=updatePreview }
+
+  local function midStart(ev)
+    dragPosMid = true
+    lastMidX, lastMidY = ev.x, ev.y
+  end
+  local function midMove(ev)
+    if not dragPosMid then return end
+    local dx = (ev.x - lastMidX)
+    local dy = (ev.y - lastMidY)
+    lastMidX, lastMidY = ev.x, ev.y
+    head_off_x = head_off_x + dx
+    head_off_y = head_off_y + dy
+    updatePreview()
+  end
+  local function midEnd()
+    dragPosMid = false
+  end
+
+  local function posGraphLeftStart(ev)
+    dragPosLeft = true
+    lastPosX, lastPosY = ev.x, ev.y
+  end
+  local function posGraphLeftMove(ev)
+    if not dragPosLeft then return end
+    local dx = (ev.x - lastPosX)
+    local dy = (ev.y - lastPosY)
+    lastPosX, lastPosY = ev.x, ev.y
+    head_off_x = head_off_x + dx
+    head_off_y = head_off_y + dy
+    updatePreview()
+  end
+  local function posGraphLeftEnd()
+    dragPosLeft = false
+  end
+
+  local function paintGraphBase(gc)
+    gc.color = Color{r=240,g=240,b=240,a=255}
+    gc:fillRect(Rectangle(0,0,PAD_W,PAD_H))
+    gc.color = Color{r=40,g=40,b=40,a=255}
+    gc:rect(Rectangle(0,0,PAD_W-1,PAD_H-1))
+    local a = clamp(tonumber(wireAlphaForPad) or 255, 0, 255)
+    gc.color = Color{r=100,g=100,b=100,a=a}
+    gc:fillRect(Rectangle(PAD_W/2,0,1,PAD_H))
+    gc:fillRect(Rectangle(0,PAD_H/2,PAD_W,1))
+  end
+
+  local function paintControlDot(gc, nx, ny, r, g, b)
+    local x = math.floor((margin + nx * (PAD_W - margin*2)) + 0.5)
+    local y = math.floor((margin + ny * (PAD_H - margin*2)) + 0.5)
+    gc.color = Color{r=r,g=g,b=b,a=255}
+    gc:fillRect(Rectangle(x-3,y-3,7,7))
+  end
+
+  local function paintRot(gc)
+    paintGraphBase(gc)
+    local nx, ny = getControlDotNxNy("rot")
+    paintControlDot(gc, nx, ny, 0, 120, 255)
+  end
+
+  local function paintRoll(gc)
+    paintGraphBase(gc)
+    local nx, ny = getControlDotNxNy("roll")
+    paintControlDot(gc, nx, ny, 255, 60, 60)
+  end
+
+  local function paintPos(gc)
+    paintGraphBase(gc)
+    local cx = math.floor(PAD_W/2)
+    local cy = math.floor(PAD_H/2)
+    gc.color = Color{r=0,g=120,b=255,a=255}
+    gc:fillRect(Rectangle(cx-1,cy-1,3,3))
+  end
+
+  local function paintCombined(gc)
+    paintGraphBase(gc)
+    local nxR, nyR = getControlDotNxNy("roll")
+    paintControlDot(gc, nxR, nyR, 255, 60, 60)
+    local nxB, nyB = getControlDotNxNy("rot")
+    paintControlDot(gc, nxB, nyB, 0, 120, 255)
+  end
+
+  -- Row 1: combined (hidden) / rot / roll
   dlg:canvas{
-    id="pad1",
+    id="pad_combo",
     label="",
-    width=72, height=72,
-    onpaint=function(ev)
-      local gc = ev.context
-      gc.color = Color{r=240,g=240,b=240,a=255}
-      gc:fillRect(Rectangle(0,0,72,72))
-      gc.color = Color{r=40,g=40,b=40,a=255}
-      gc:rect(Rectangle(0,0,71,71))
-
-      local a = clamp(tonumber(wireAlphaForPad) or 255, 0, 255)
-      gc.color = Color{r=100,g=100,b=100,a=a}
-      gc:fillRect(Rectangle(36,0,1,72))
-      gc:fillRect(Rectangle(0,36,72,1))
-
-      local x = math.floor((6 + p1x * (72 - 12)) + 0.5)
-      local y = math.floor((6 + p1y * (72 - 12)) + 0.5)
-      gc.color = Color{r=0,g=120,b=255,a=255}
-      gc:fillRect(Rectangle(x-3,y-3,7,7))
-    end,
+    width=PAD_W, height=PAD_H,
+    visible=false,
+    onpaint=function(ev) paintCombined(ev.context) end,
+    onwheel=function(ev) adjustRadiusByWheel(ev); updatePreview() end,
     onmousedown=function(ev)
-      p1x, p1y = screenToN(ev.x, ev.y)
-      drag1 = true
-      updatePreview()
+      if btnIs(ev, "MIDDLE") then midStart(ev); return end
+      local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+      if btnIs(ev, "RIGHT") then
+        dragRoll = true
+        applyControlFromNxNy("roll", nx, ny)
+        updatePreview()
+        return
+      end
+      if btnIs(ev, "LEFT") then
+        dragRot = true
+        applyControlFromNxNy("rot", nx, ny)
+        updatePreview()
+        return
+      end
     end,
     onmousemove=function(ev)
-      if not drag1 then return end
-      p1x, p1y = screenToN(ev.x, ev.y)
-      updatePreview()
+      if dragPosMid then midMove(ev); return end
+      if dragRoll then
+        local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+        applyControlFromNxNy("roll", nx, ny)
+        updatePreview()
+        return
+      end
+      if dragRot then
+        local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+        applyControlFromNxNy("rot", nx, ny)
+        updatePreview()
+        return
+      end
     end,
-    onmouseup=function() drag1 = false end
+    onmouseup=function(ev)
+      if dragPosMid then midEnd(); return end
+      dragRot = false
+      dragRoll = false
+    end
+  }
+
+  dlg:canvas{
+    id="pad_rot",
+    label="",
+    width=PAD_W, height=PAD_H,
+    onpaint=function(ev) paintRot(ev.context) end,
+    onwheel=function(ev) adjustRadiusByWheel(ev); updatePreview() end,
+    onmousedown=function(ev)
+      if btnIs(ev, "MIDDLE") then midStart(ev); return end
+      if btnIs(ev, "LEFT") then
+        dragRot = true
+        local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+        applyControlFromNxNy("rot", nx, ny)
+        updatePreview()
+      end
+    end,
+    onmousemove=function(ev)
+      if dragPosMid then midMove(ev); return end
+      if dragRot then
+        local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+        applyControlFromNxNy("rot", nx, ny)
+        updatePreview()
+      end
+    end,
+    onmouseup=function(ev)
+      if dragPosMid then midEnd(); return end
+      dragRot = false
+    end
+  }
+
+  dlg:canvas{
+    id="pad_roll",
+    width=PAD_W, height=PAD_H,
+    onpaint=function(ev) paintRoll(ev.context) end,
+    onwheel=function(ev) adjustRadiusByWheel(ev); updatePreview() end,
+    onmousedown=function(ev)
+      if btnIs(ev, "MIDDLE") then midStart(ev); return end
+      if btnIs(ev, "LEFT") then
+        dragRoll = true
+        local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+        applyControlFromNxNy("roll", nx, ny)
+        updatePreview()
+      end
+    end,
+    onmousemove=function(ev)
+      if dragPosMid then midMove(ev); return end
+      if dragRoll then
+        local nx, ny = screenToN(ev.x, ev.y, PAD_W, PAD_H)
+        applyControlFromNxNy("roll", nx, ny)
+        updatePreview()
+      end
+    end,
+    onmouseup=function(ev)
+      if dragPosMid then midEnd(); return end
+      dragRoll = false
+    end
+  }
+
+  -- Row 2: position graph
+  dlg:newrow()
+  dlg:canvas{
+    id="pad_pos",
+    label="",
+    width=PAD_W, height=PAD_H,
+    onpaint=function(ev) paintPos(ev.context) end,
+    onwheel=function(ev) adjustRadiusByWheel(ev); updatePreview() end,
+    onmousedown=function(ev)
+      if btnIs(ev, "MIDDLE") then midStart(ev); return end
+      if btnIs(ev, "LEFT") then posGraphLeftStart(ev) end
+    end,
+    onmousemove=function(ev)
+      if dragPosMid then midMove(ev); return end
+      if dragPosLeft then posGraphLeftMove(ev) end
+    end,
+    onmouseup=function(ev)
+      if dragPosMid then midEnd(); return end
+      posGraphLeftEnd()
+    end
   }
 
   dlg:newrow()
+
+  local function setCombinedState()
+    if not dlg then return end
+    local c = (dlg.data.combined == true)
+    pcall(function() dlg:modify{ id="pad_rot",  visible = not c } end)
+    pcall(function() dlg:modify{ id="pad_roll", visible = not c } end)
+    pcall(function() dlg:modify{ id="pad_pos",  visible = not c } end)
+    pcall(function() dlg:modify{ id="pad_combo", visible = c } end)
+    updatePreview()
+  end
+
+  -- Full 180 + Combined + Swap X/Y on same row
   dlg:check{
     id="full_180",
     label="",
     text="Full 180",
     selected=false,
-    onclick=updatePreview
+    onclick=function()
+      local lim = rollRange()
+      local r1 = clamp(tonumber(dlg.data.roll) or 0, -lim, lim)
+      local r2 = clamp(tonumber(dlg.data.spin) or 0, -lim, lim)
+      pcall(function() dlg:modify{ id="roll", value=r1 } end)
+      pcall(function() dlg:modify{ id="spin", value=r2 } end)
+      updatePreview()
+    end
   }
 
-  dlg:slider{ id="roll", label="Roll:", min=-180, max=180, value=0, onchange=updatePreview }
+  dlg:check{
+    id="combined",
+    text="Combined",
+    selected=false,
+    onclick=function()
+      setCombinedState()
+    end
+  }
+
+  dlg:check{
+    id="swap_x",
+    text="Swap X",
+    selected=false,
+    onclick=function()
+      updatePreview()
+    end
+  }
+
+  dlg:check{
+    id="swap_y",
+    text="Swap Y",
+    selected=false,
+    onclick=function()
+      updatePreview()
+    end
+  }
+
   dlg:newrow()
 
   rollSideChecks(
@@ -1311,7 +1789,6 @@ do
   dlg:check{ id="show_cuts",  text="Cuts",  selected=true, onclick=updatePreview }
   dlg:newrow()
 
-  -- hidden (kept for preset state)
   dlg:check{ id="show_face", label="", text="Face", selected=true, visible=false, onclick=updatePreview }
   dlg:check{ id="show_jaws", text="Jaws", selected=true, visible=false, onclick=updatePreview }
   dlg:check{ id="show_chin", text="Chin", selected=true, visible=false, onclick=updatePreview }
@@ -1353,20 +1830,24 @@ do
   dlg:slider{ id="ear_scale", label="Scale:", min=10, max=300, value=100, onchange=updatePreview } ; reg("ears","ear_scale")
   dlg:newrow()
 
+  -- Alpha sliders: same row
   dlg:slider{ id="alpha_front", label="Alpha:", min=0, max=255, value=255, onchange=updatePreview }
-  dlg:slider{ id="alpha_back",  label="Alpha:", min=0, max=255, value=26,  onchange=updatePreview }
+  dlg:slider{ id="alpha_back",  min=0, max=255, value=26,  onchange=updatePreview }
   dlg:newrow()
 
   dlg:button{ text="Apply", onclick=function() applyPreview(); dlg:close() end }
+  dlg:button{ text="Add", onclick=function() addStamp() end }
   dlg:button{ text="Cancel", onclick=function()
-    app.transaction(function() deletePreviewLayer() end)
+    app.transaction(function()
+      deletePreviewLayer()
+      clearAccum()
+    end)
     dlg:close()
     app.refresh()
   end}
 
   dlg:show{ wait=false }
 
-  -- Initialize authoritative selection from the dialog AFTER show.
   do
     local v = (dlg.data and dlg.data.base_file) or "default.txt"
     CURRENT_PRESET_FILE = fileSafe(v)
@@ -1377,5 +1858,7 @@ do
   end
 
   loadShape()
+  loadPose(true)
+  setCombinedState()
   updatePreview()
 end

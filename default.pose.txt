@@ -1,0 +1,6 @@
+p1x=0.5
+p1y=0.5
+roll=0
+radius_t=50
+radius_px=0
+roll_side=bottom
